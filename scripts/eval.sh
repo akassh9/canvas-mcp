@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Ask a model real Canvas questions using only this MCP, then show which tools it called
-# and what it answered. Usage: scripts/eval.sh [model]   (default: haiku)
+# and what it answered.
+#   scripts/eval.sh [model]                     (default: haiku)
+#   TOOL_SEARCH=off scripts/eval.sh haiku       load MCP tools up front instead of deferring them
 set -euo pipefail
 
 MODEL="${1:-haiku}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/eval-runs/$(date +%Y%m%d-%H%M%S)-$MODEL"
+OUT="$ROOT/eval-runs/$(date +%Y%m%d-%H%M%S)-$MODEL${TOOL_SEARCH:+-toolsearch-$TOOL_SEARCH}"
 mkdir -p "$OUT"
+# Run the model from an empty folder: inside this repo it starts reading the MCP's source
+# instead of calling its tools, which a real user's session wouldn't invite.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+[ "${TOOL_SEARCH:-}" = "off" ] && export ENABLE_TOOL_SEARCH=false
 
 cat > "$OUT/mcp.json" <<EOF
 {"mcpServers":{"canvas":{"command":"node","args":["$ROOT/src/mcp.ts"]}}}
@@ -28,9 +35,9 @@ QUESTIONS=(
 for i in "${!QUESTIONS[@]}"; do
   # Background subagents outlive a one-shot -p run, so the answer would be lost; deny them.
   # Other built-in tools stay visible (but unapproved) to mirror a normal session.
-  (cd "$OUT" && claude -p "${QUESTIONS[$i]}" --model "$MODEL" --mcp-config mcp.json --strict-mcp-config \
+  (cd "$WORK" && claude -p "${QUESTIONS[$i]}" --model "$MODEL" --mcp-config "$OUT/mcp.json" --strict-mcp-config \
     --allowedTools "${ALLOWED[@]}" --disallowedTools Agent Task \
-    --output-format stream-json --verbose < /dev/null > "q$i.jsonl" 2> "q$i.err") &
+    --output-format stream-json --verbose < /dev/null > "$OUT/q$i.jsonl" 2> "$OUT/q$i.err") &
 done
 wait
 
