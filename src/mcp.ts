@@ -89,6 +89,30 @@ server.registerTool(
   ({ course_id, search }) => run(() => canvas.files(course_id, search)),
 );
 
+const fileId = z.coerce.string().regex(/^\d+(~\d+)?$/).describe("Canvas file ID (from canvas_files or canvas_assignment)");
+
+server.registerTool(
+  "canvas_assignment",
+  {
+    description: "One assignment's full instructions, submission state, and the files linked in its description.",
+    inputSchema: { course_id: courseId, assignment_id: z.coerce.string().regex(/^\d+$/) },
+  },
+  ({ course_id, assignment_id }) => run(() => canvas.assignment(course_id, assignment_id)),
+);
+
+server.registerTool(
+  "canvas_download_file",
+  {
+    description: "Download a Canvas file to disk (default ~/Downloads). Never overwrites; adds a (1), (2)... suffix instead.",
+    inputSchema: {
+      file_id: fileId,
+      course_id: courseId.optional().describe("Course the file belongs to; needed for files linked from course pages"),
+      dir: z.string().optional().describe("Absolute directory to save into"),
+    },
+  },
+  ({ file_id, course_id, dir }) => run(() => canvas.downloadFile(file_id, dir, course_id)),
+);
+
 server.registerTool(
   "canvas_get",
   {

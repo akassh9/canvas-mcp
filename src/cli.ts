@@ -10,6 +10,8 @@ const commands: Record<string, () => Promise<unknown>> = {
   assignments: () => canvas.assignments(arg),
   modules: () => canvas.modules(arg),
   files: () => canvas.files(arg),
+  assignment: () => canvas.assignment(arg, process.argv[4]),
+  download: () => canvas.downloadFile(arg, undefined, process.argv[4]),
   announcements: async () => canvas.announcements((await canvas.courses()).map((c) => c.id)),
 };
 

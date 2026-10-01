@@ -1,5 +1,9 @@
 // Minimal read-only Canvas client that authenticates with a browser session cookie.
 
+import { access, mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, extname, join } from "node:path";
+
 try {
   process.loadEnvFile(new URL("../.env", import.meta.url));
 } catch {
@@ -164,6 +168,91 @@ export async function assignments(courseId: string, bucket?: string) {
     late: a.submission?.late ?? null,
     url: a.html_url,
   }));
+}
+
+// Instructors usually attach handouts as links inside the description, not as Canvas "attachments".
+export async function assignment(courseId: string, assignmentId: string) {
+  const a = await get<any>(`/api/v1/courses/${courseId}/assignments/${assignmentId}`, {
+    "include[]": ["submission"],
+  });
+  const html: string = a.description ?? "";
+  // Linked file IDs may use Canvas's short "shard~id" form, e.g. 6078~11925851.
+  const fileIds = [...new Set([...html.matchAll(/\/files\/(\d+(?:~\d+)?)/g)].map((m) => m[1]))];
+  const linkedFiles = await Promise.all(
+    fileIds.map(async (id) => {
+      try {
+        const f = await get<any>(`/api/v1/courses/${courseId}/files/${id}`);
+        return { id: f.id, name: f.display_name, size: f.size, content_type: f["content-type"] };
+      } catch (err) {
+        return { id, error: (err as Error).message };
+      }
+    }),
+  );
+  return {
+    id: a.id,
+    name: a.name,
+    due: a.due_at,
+    points: a.points_possible,
+    submission_types: a.submission_types,
+    state: a.submission?.workflow_state ?? null,
+    description: stripHtml(html).slice(0, 5000),
+    linked_files: linkedFiles,
+    url: a.html_url,
+  };
+}
+
+// Saves a file to disk without overwriting existing files. Returns the saved path.
+export async function downloadFile(fileId: string, dir = join(homedir(), "Downloads"), courseId?: string) {
+  const meta = await get<any>(courseId ? `/api/v1/courses/${courseId}/files/${fileId}` : `/api/v1/files/${fileId}`);
+  if (!meta.url) throw new Error(`Canvas returned no download URL for file ${fileId} (it may be locked).`);
+
+  // Downloads bounce through a cross-domain login on the instructure.com host, which sets
+  // its own session cookie. Follow redirects by hand with a per-host cookie jar so the
+  // user's Canvas cookie is only ever sent to the Canvas host itself.
+  const jar = new Map<string, Map<string, string>>();
+  let url: string = meta.url;
+  let res: Response | undefined;
+  for (let hop = 0; hop < 10; hop++) {
+    const host = new URL(url).host;
+    const sameHost = host === new URL(BASE_URL).host;
+    const picked = [...(jar.get(host) ?? new Map())].map(([k, v]) => `${k}=${v}`).join("; ");
+    const h: Record<string, string> = sameHost ? headers() : {};
+    if (picked) h.Cookie = sameHost ? `${h.Cookie}; ${picked}` : picked;
+    res = await fetch(url, { headers: h, redirect: "manual" });
+    for (const c of res.headers.getSetCookie()) {
+      const [pair] = c.split(";");
+      const eq = pair.indexOf("=");
+      if (eq > 0) {
+        if (!jar.has(host)) jar.set(host, new Map());
+        jar.get(host)!.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+      }
+    }
+    const location = res.headers.get("location");
+    if (res.status < 300 || res.status >= 400 || !location) break;
+    if (new URL(location, url).pathname.startsWith("/login")) {
+      throw new CanvasAuthError("Canvas session expired or invalid. Refresh CANVAS_COOKIE in .env.");
+    }
+    url = new URL(location, url).toString();
+  }
+  if (!res?.ok) throw new Error(`Download failed with status ${res?.status} for ${meta.display_name}`);
+
+  await mkdir(dir, { recursive: true });
+  const path = await freePath(dir, basename(meta.display_name || `canvas-file-${fileId}`));
+  await writeFile(path, Buffer.from(await res.arrayBuffer()), { flag: "wx" });
+  return { path, name: meta.display_name, size: meta.size };
+}
+
+async function freePath(dir: string, name: string): Promise<string> {
+  const ext = extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  for (let n = 0; ; n++) {
+    const candidate = join(dir, n ? `${stem} (${n})${ext}` : name);
+    try {
+      await access(candidate);
+    } catch {
+      return candidate;
+    }
+  }
 }
 
 export async function announcements(courseIds: string[], days = 30) {

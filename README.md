@@ -29,5 +29,6 @@ claude mcp add canvas -- node /Users/akashkhanikor/canvas-mcp/src/mcp.ts
 ```
 
 Tools: `canvas_whoami`, `canvas_courses`, `canvas_todo`, `canvas_assignments`,
-`canvas_announcements`, `canvas_modules`, `canvas_files`, and `canvas_get` (any read-only
-`/api/v1/...` path).
+`canvas_assignment` (instructions + linked files), `canvas_announcements`, `canvas_modules`,
+`canvas_files`, `canvas_download_file` (saves to ~/Downloads, never overwrites), and
+`canvas_get` (any read-only `/api/v1/...` path).
