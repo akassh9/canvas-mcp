@@ -1,5 +1,6 @@
 // Read-only Canvas helpers that return compact, model-friendly shapes.
-// IDs are always the global form; dates come with local time and a relative hint.
+// IDs are in the form Canvas uses on this host (inputs accept any form); dates come with
+// local time and a relative hint.
 
 import { execFile } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile as readFs, rm, writeFile } from "node:fs/promises";
@@ -13,6 +14,7 @@ import {
   get,
   getAll,
   linkedFileIds,
+  sessionSource,
   stripHtml,
   toGlobalId,
   tryGet,
@@ -33,6 +35,7 @@ type Submission = {
 
 type Assignment = {
   id: string;
+  course_id?: string;
   name: string;
   due_at: string | null;
   points_possible: number | null;
@@ -58,7 +61,7 @@ function status(a: Assignment): string {
 
 export async function whoami() {
   const [me, tz] = await Promise.all([get<{ id: string; name: string }>("/api/v1/users/self"), userTimeZone()]);
-  return { user_id: me.id, name: me.name, time_zone: tz };
+  return { user_id: me.id, name: me.name, time_zone: tz, session_from: await sessionSource() };
 }
 
 type Course = {
@@ -167,7 +170,7 @@ export async function assignments(courseId: string, bucket?: string) {
   ]);
   return list.map((a) => ({
     assignment_id: a.id,
-    course_id: courseId,
+    course_id: a.course_id ?? courseId,
     name: a.name,
     ...dueFields(a.due_at, tz),
     points: a.points_possible,
@@ -197,7 +200,7 @@ export async function assignment(courseId: string, assignmentId: string) {
   );
   return {
     assignment_id: a.id,
-    course_id: courseId,
+    course_id: a.course_id ?? courseId,
     name: a.name,
     ...dueFields(a.due_at, tz),
     points: a.points_possible,
@@ -223,7 +226,7 @@ export async function announcements(courseIds: string[], days = 30) {
   return list.map((a) => {
     const courseId = String(a.context_code ?? "").replace(/^course_/, "");
     return {
-      course_id: courseId,
+      course_id: a.course_id ?? courseId,
       course: names.get(courseId) ?? null,
       title: a.title,
       ...dueFields(a.posted_at, tz, "posted"),
@@ -355,7 +358,7 @@ export async function gradeBreakdown(courseId: string) {
   }
 
   return {
-    course_id: courseId,
+    course_id: course.id,
     course: course.name,
     grading: weighted
       ? "Weighted by assignment group (weights below)."

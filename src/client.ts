@@ -1,34 +1,99 @@
 // Low-level Canvas access: session-cookie auth, pagination, ID and date normalization.
 
+import { logout as clearSession, loadStored, refreshSession, type Session } from "./session.ts";
+
 try {
   process.loadEnvFile(new URL("../.env", import.meta.url));
 } catch {
   // No .env file; rely on the real environment.
 }
 
-export const BASE_URL = (process.env.CANVAS_BASE_URL ?? "https://canvas.wustl.edu").replace(/\/$/, "");
-const COOKIE = process.env.CANVAS_COOKIE ?? "";
+// WashU's canonical Canvas host. canvas.wustl.edu serves the same Canvas, but signing in through
+// it lands on a "No Canvas Account Found" page, so log in and call the API here instead.
+export const BASE_URL = (process.env.CANVAS_BASE_URL || "https://wustl.instructure.com").replace(/\/$/, "");
+const ENV_COOKIE = process.env.CANVAS_COOKIE?.trim() || undefined;
+// Set CANVAS_AUTO_LOGIN=0 to never open a login window automatically.
+const AUTO_LOGIN = process.env.CANVAS_AUTO_LOGIN !== "0";
+// How long a tool call waits for the user to finish signing in before giving up for now.
+const LOGIN_WAIT_MS = Number(process.env.CANVAS_LOGIN_WAIT_MS ?? 90_000);
 
 export class CanvasAuthError extends Error {}
 
-const EXPIRED = "Canvas session expired or invalid. Refresh CANVAS_COOKIE in .env.";
+const LOGIN_HINT = "Run `npm run login` in the canvas-mcp folder.";
+const EXPIRED = `Canvas session expired. ${LOGIN_HINT}`;
+
+// The saved session (Keychain) wins over .env; .env still works for manual setups.
+let session: Promise<Session | undefined> | undefined;
+
+function currentSession(): Promise<Session | undefined> {
+  session ??= loadStored(BASE_URL).then((s) => s ?? (ENV_COOKIE ? { cookie: ENV_COOKIE, source: ".env" } : undefined));
+  return session;
+}
+
+export async function sessionSource(): Promise<string | null> {
+  return (await currentSession())?.source ?? null;
+}
+
+// Refreshes the session after Canvas rejects `rejected` (or when there is none). If the user
+// has to sign in, waits up to LOGIN_WAIT_MS; the login window stays open after that, and the
+// next call picks up the new session.
+async function recover(rejected?: string): Promise<void> {
+  if (!AUTO_LOGIN) throw new CanvasAuthError(rejected ? EXPIRED : `Not signed in to Canvas. ${LOGIN_HINT}`);
+  const refresh = refreshSession(BASE_URL, { rejected, envCookie: ENV_COOKIE });
+  refresh.then(
+    (s) => (session = Promise.resolve(s)),
+    () => (session = undefined),
+  );
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), LOGIN_WAIT_MS)));
+  try {
+    const outcome = await Promise.race([refresh.then(() => "ok" as const), timeout]);
+    if (outcome === "timeout") {
+      throw new CanvasAuthError(
+        "The Canvas session expired, so a Canvas sign-in window is open. Ask the user to finish signing in there, then try again.",
+      );
+    }
+  } catch (err) {
+    if (err instanceof CanvasAuthError) throw err;
+    throw new CanvasAuthError(`Canvas sign-in didn't finish: ${(err as Error).message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Explicit login (CLI / canvas_login tool). Reuses a still-valid session unless `force`.
+export async function login(
+  opts: { force?: boolean; onWindow?: () => void; log?: (msg: string) => void } = {},
+): Promise<Session> {
+  const s = await refreshSession(BASE_URL, { ...opts, envCookie: ENV_COOKIE, timeoutMs: 5 * 60_000 });
+  session = Promise.resolve(s);
+  return s;
+}
+
+export async function logout(): Promise<void> {
+  await clearSession(BASE_URL);
+  session = undefined;
+}
 
 function csrfToken(cookie: string): string | undefined {
   const match = cookie.match(/(?:^|;\s*)_csrf_token=([^;]+)/);
   return match ? decodeURIComponent(match[1]) : undefined;
 }
 
-export function headers(): Record<string, string> {
-  if (!COOKIE) {
-    throw new CanvasAuthError("CANVAS_COOKIE is not set. Copy it from DevTools into .env (see README).");
+export async function headers(): Promise<Record<string, string>> {
+  let s = await currentSession();
+  if (!s) {
+    await recover();
+    s = await currentSession();
   }
+  if (!s) throw new CanvasAuthError(`Not signed in to Canvas. ${LOGIN_HINT}`);
   const h: Record<string, string> = {
-    Cookie: COOKIE,
+    Cookie: s.cookie,
     // Return IDs as strings: WashU IDs exceed Number.MAX_SAFE_INTEGER and would be rounded.
     Accept: "application/json+canvas-string-ids",
     "X-Requested-With": "XMLHttpRequest",
   };
-  const csrf = csrfToken(COOKIE);
+  const csrf = csrfToken(s.cookie);
   if (csrf) h["X-CSRF-Token"] = csrf;
   return h;
 }
@@ -55,10 +120,15 @@ function buildUrl(path: string, params: Params = {}): string {
   return url.toString();
 }
 
-async function request(url: string): Promise<{ body: unknown; next?: string }> {
-  const res = await fetch(url, { headers: headers(), redirect: "manual" });
+async function request(url: string, retried = false): Promise<{ body: unknown; next?: string }> {
+  const h = await headers();
+  const res = await fetch(url, { headers: h, redirect: "manual" });
   // An expired session either 401s or redirects to the SSO login page.
-  if (res.status === 401 || (res.status >= 300 && res.status < 400)) throw new CanvasAuthError(EXPIRED);
+  if (res.status === 401 || (res.status >= 300 && res.status < 400)) {
+    if (retried) throw new CanvasAuthError(EXPIRED);
+    await recover(h.Cookie);
+    return request(url, true);
+  }
   const text = await res.text();
   if (res.status === 403) {
     throw new Error(`Canvas 403: not available to students in this course (${new URL(url).pathname}).`);
@@ -167,7 +237,7 @@ export async function fetchFile(fileId: string, courseId?: string) {
     const host = new URL(url).host;
     const sameHost = host === new URL(BASE_URL).host;
     const picked = [...(jar.get(host) ?? new Map())].map(([k, v]) => `${k}=${v}`).join("; ");
-    const h: Record<string, string> = sameHost ? headers() : {};
+    const h: Record<string, string> = sameHost ? await headers() : {};
     if (picked) h.Cookie = sameHost ? `${h.Cookie}; ${picked}` : picked;
     res = await fetch(url, { headers: h, redirect: "manual" });
     for (const c of res.headers.getSetCookie()) {

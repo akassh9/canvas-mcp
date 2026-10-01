@@ -1,12 +1,30 @@
 // Quick smoke test: node src/cli.ts <command> [args...]
 import * as canvas from "./canvas.ts";
-import { toGlobalId } from "./client.ts";
+import { login, logout, toGlobalId } from "./client.ts";
 import * as search from "./search.ts";
 
 const [command = "whoami", ...args] = process.argv.slice(2);
 const id = (i: number) => toGlobalId(args[i]);
 
 const commands: Record<string, () => Promise<unknown>> = {
+  login: async () => {
+    console.error("Checking for a saved Canvas session...");
+    const s = await login({
+      // Always go through the browser so the login profile (SSO, Duo) is set up for silent refreshes.
+      force: true,
+      onWindow: () => console.error("Opening a Chrome window: sign in to Canvas there (SSO and Duo as usual)."),
+      log: (msg) => console.error(msg),
+    });
+    const me = await canvas.whoami();
+    return {
+      signed_in_as: me.name,
+      saved_to: s.source === "login" ? (process.platform === "darwin" ? "~/.canvas-mcp (encrypted; key in macOS Keychain)" : "~/.canvas-mcp") : s.source,
+    };
+  },
+  logout: async () => {
+    await logout();
+    return { signed_out: true, note: "Removed the saved session and the login browser profile." };
+  },
   whoami: canvas.whoami,
   courses: () => canvas.courses(args[0] === "all"),
   todo: () => canvas.todo(args[0] ? Number(args[0]) : 14),

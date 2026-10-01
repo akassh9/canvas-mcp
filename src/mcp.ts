@@ -2,12 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as canvas from "./canvas.ts";
-import { toGlobalId } from "./client.ts";
+import { login, toGlobalId } from "./client.ts";
 import * as search from "./search.ts";
 
 const TOOL_NAMES = [
   "courses", "todo", "assignments", "assignment", "grade_breakdown", "announcements", "modules",
-  "files", "search", "syllabus", "read_file", "download_file", "get", "whoami",
+  "files", "search", "syllabus", "read_file", "download_file", "get", "whoami", "login",
 ].map((t) => `canvas_${t}`);
 
 // Shown to the model in its system prompt. Smaller models in particular tried to reach
@@ -17,6 +17,7 @@ const INSTRUCTIONS = `Read-only access to the user's Canvas LMS (their courses, 
 - These are tools: call them directly. There is no CLI, shell command, or HTTP endpoint for this server.
 - If the tools are deferred, load them all in ONE ToolSearch call, e.g. "select:" followed by the full names of: ${TOOL_NAMES.join(", ")} (each prefixed the way your tool list shows, typically mcp__canvas__).
 - Get course_id values from canvas_courses first. "What's due" questions: canvas_todo.
+- If a tool says a Canvas sign-in window is open, ask the user to finish signing in there, then retry. Don't ask them for passwords or cookies.
 - When telling the user a date, use the *_local and *_in fields (the user's time zone), never the UTC field.
 - Grade composition / "how much is X worth": canvas_grade_breakdown. Syllabus: canvas_syllabus. "Is there / where is X": canvas_search.`;
 
@@ -47,6 +48,21 @@ server.registerTool(
   "canvas_whoami",
   { description: "Check the Canvas session works. Returns the signed-in user and their time zone." },
   () => run(canvas.whoami),
+);
+
+server.registerTool(
+  "canvas_login",
+  {
+    description:
+      "Sign in to Canvas: reuses a saved session if it still works, otherwise opens a Chrome window where the user signs in themselves (waits up to 5 minutes). Other tools do this automatically when the session expires; call this only if the user asks to sign in again or switch accounts.",
+    inputSchema: { force: z.boolean().default(false).describe("Open the sign-in window even if the saved session works") },
+  },
+  ({ force }) =>
+    run(async () => {
+      const s = await login({ force });
+      const me = await canvas.whoami();
+      return { signed_in_as: me.name, session_from: s.source };
+    }),
 );
 
 server.registerTool(
