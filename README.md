@@ -1,7 +1,8 @@
 # canvas-mcp
 
-Read-only Canvas (canvas.wustl.edu) API client and MCP server. It signs in with your browser
-session cookie, because WashU doesn't let students create personal access tokens.
+Read-only Canvas LMS API client and MCP server, built against canvas.wustl.edu (set
+`CANVAS_BASE_URL` in `.env` for another school). It signs in with your browser session cookie,
+because WashU doesn't let students create personal access tokens.
 
 ## Set up the cookie
 
@@ -29,7 +30,8 @@ Course and file IDs can be given in either Canvas format (`60780000000180256` or
 ## Use as an MCP server
 
 ```bash
-claude mcp add canvas -s user -- node /Users/akashkhanikor/canvas-mcp/src/mcp.ts
+npm install
+claude mcp add canvas -s user -- node "$(pwd)/src/mcp.ts"   # run from the repo folder
 ```
 
 | Tool | What it does |
