@@ -5,7 +5,22 @@ import * as canvas from "./canvas.ts";
 import { toGlobalId } from "./client.ts";
 import * as search from "./search.ts";
 
-const server = new McpServer({ name: "canvas", version: "0.2.0" });
+const TOOL_NAMES = [
+  "courses", "todo", "assignments", "assignment", "grade_breakdown", "announcements", "modules",
+  "files", "search", "syllabus", "read_file", "download_file", "get", "whoami",
+].map((t) => `canvas_${t}`);
+
+// Shown to the model in its system prompt. Smaller models in particular tried to reach
+// this server through Bash or HTTP when its tools were deferred, so spell out the basics.
+const INSTRUCTIONS = `Read-only access to the user's Canvas LMS (their courses, assignments, grades, files).
+
+- These are tools: call them directly. There is no CLI, shell command, or HTTP endpoint for this server.
+- If the tools are deferred, load them all in ONE ToolSearch call, e.g. "select:" followed by the full names of: ${TOOL_NAMES.join(", ")} (each prefixed the way your tool list shows, typically mcp__canvas__).
+- Get course_id values from canvas_courses first. "What's due" questions: canvas_todo.
+- When telling the user a date, use the *_local and *_in fields (the user's time zone), never the UTC field.
+- Grade composition / "how much is X worth": canvas_grade_breakdown. Syllabus: canvas_syllabus. "Is there / where is X": canvas_search.`;
+
+const server = new McpServer({ name: "canvas", version: "0.2.0" }, { instructions: INSTRUCTIONS });
 
 function result(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };

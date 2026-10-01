@@ -26,8 +26,11 @@ QUESTIONS=(
 )
 
 for i in "${!QUESTIONS[@]}"; do
+  # Background subagents outlive a one-shot -p run, so the answer would be lost; deny them.
+  # Other built-in tools stay visible (but unapproved) to mirror a normal session.
   (cd "$OUT" && claude -p "${QUESTIONS[$i]}" --model "$MODEL" --mcp-config mcp.json --strict-mcp-config \
-    --allowedTools "${ALLOWED[@]}" --output-format stream-json --verbose < /dev/null > "q$i.jsonl" 2> "q$i.err") &
+    --allowedTools "${ALLOWED[@]}" --disallowedTools Agent Task \
+    --output-format stream-json --verbose < /dev/null > "q$i.jsonl" 2> "q$i.err") &
 done
 wait
 
