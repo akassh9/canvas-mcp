@@ -1,281 +1,252 @@
-// Minimal read-only Canvas client that authenticates with a browser session cookie.
+// Read-only Canvas helpers that return compact, model-friendly shapes.
+// IDs are always the global form; dates come with local time and a relative hint.
 
-import { access, mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { execFile } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile as readFs, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
+import { promisify } from "node:util";
+import {
+  BASE_URL,
+  dueFields,
+  fetchFile,
+  get,
+  getAll,
+  linkedFileIds,
+  stripHtml,
+  toGlobalId,
+  tryGet,
+  userTimeZone,
+} from "./client.ts";
 
-try {
-  process.loadEnvFile(new URL("../.env", import.meta.url));
-} catch {
-  // No .env file; rely on the real environment.
+export { CanvasAuthError, get, getAll, toGlobalId } from "./client.ts";
+
+type Submission = {
+  score: number | null;
+  grade: string | null;
+  excused: boolean | null;
+  missing: boolean | null;
+  late: boolean | null;
+  submitted_at: string | null;
+  workflow_state: string;
+};
+
+type Assignment = {
+  id: string;
+  name: string;
+  due_at: string | null;
+  points_possible: number | null;
+  omit_from_final_grade?: boolean;
+  html_url: string;
+  submission?: Submission;
+  description?: string | null;
+  submission_types?: string[];
+  assignment_group_id?: string;
+};
+
+// A short status a model can relay without interpreting several booleans.
+function status(a: Assignment): string {
+  const s = a.submission;
+  if (!s) return "unknown";
+  if (s.excused) return "excused";
+  if (s.score !== null && s.score !== undefined) return "graded";
+  if (s.submitted_at) return "submitted, awaiting grade";
+  if (s.missing) return "missing";
+  if (a.due_at && new Date(a.due_at) < new Date()) return "past due, not submitted";
+  return "not submitted";
 }
 
-const BASE_URL = (process.env.CANVAS_BASE_URL ?? "https://canvas.wustl.edu").replace(/\/$/, "");
-const COOKIE = process.env.CANVAS_COOKIE ?? "";
-
-export class CanvasAuthError extends Error {}
-
-function csrfToken(cookie: string): string | undefined {
-  const match = cookie.match(/(?:^|;\s*)_csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : undefined;
+export async function whoami() {
+  const [me, tz] = await Promise.all([get<{ id: string; name: string }>("/api/v1/users/self"), userTimeZone()]);
+  return { user_id: me.id, name: me.name, time_zone: tz };
 }
-
-function headers(): Record<string, string> {
-  if (!COOKIE) {
-    throw new CanvasAuthError("CANVAS_COOKIE is not set. Copy it from DevTools into .env (see README).");
-  }
-  const h: Record<string, string> = {
-    Cookie: COOKIE,
-    // Return IDs as strings: WashU IDs exceed Number.MAX_SAFE_INTEGER and would be rounded.
-    Accept: "application/json+canvas-string-ids",
-    "X-Requested-With": "XMLHttpRequest",
-  };
-  const csrf = csrfToken(COOKIE);
-  if (csrf) h["X-CSRF-Token"] = csrf;
-  return h;
-}
-
-// Canvas prefixes session-authenticated JSON with `while(1);` to block JSON hijacking.
-function parseBody(text: string): unknown {
-  const stripped = text.replace(/^while\(1\);/, "");
-  return stripped ? JSON.parse(stripped) : null;
-}
-
-function nextLink(link: string | null): string | undefined {
-  return link?.split(",").find((part) => part.includes('rel="next"'))?.match(/<([^>]+)>/)?.[1];
-}
-
-type Params = Record<string, string | number | boolean | string[] | undefined>;
-
-function buildUrl(path: string, params: Params = {}): string {
-  const url = new URL(path.startsWith("http") ? path : `${BASE_URL}${path}`);
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined) continue;
-    if (Array.isArray(value)) value.forEach((v) => url.searchParams.append(key, v));
-    else url.searchParams.set(key, String(value));
-  }
-  return url.toString();
-}
-
-async function request(url: string): Promise<{ body: unknown; next?: string }> {
-  const res = await fetch(url, { headers: headers(), redirect: "manual" });
-  // An expired session either 401s or redirects to the SSO login page.
-  if (res.status === 401 || (res.status >= 300 && res.status < 400)) {
-    throw new CanvasAuthError("Canvas session expired or invalid. Refresh CANVAS_COOKIE in .env.");
-  }
-  const text = await res.text();
-  if (res.status === 403) {
-    throw new Error(`Canvas 403: this course hides that section from students (${new URL(url).pathname}).`);
-  }
-  if (!res.ok) throw new Error(`Canvas ${res.status} for ${url}: ${text.slice(0, 300)}`);
-  return { body: parseBody(text), next: nextLink(res.headers.get("link")) };
-}
-
-export async function get<T = unknown>(path: string, params: Params = {}): Promise<T> {
-  return (await request(buildUrl(path, params))).body as T;
-}
-
-// Follows Link-header pagination until exhausted or `limit` items are collected.
-export async function getAll<T = unknown>(path: string, params: Params = {}, limit = 500): Promise<T[]> {
-  const items: T[] = [];
-  let url: string | undefined = buildUrl(path, { per_page: 100, ...params });
-  while (url && items.length < limit) {
-    const { body, next } = await request(url);
-    items.push(...(body as T[]));
-    url = next;
-  }
-  return items.slice(0, limit);
-}
-
-// ---- Typed helpers for the views students use most ----
 
 type Course = {
   id: string;
   name: string;
   course_code: string;
+  hide_final_grades?: boolean;
+  apply_assignment_group_weights?: boolean;
   term?: { name: string };
-  enrollments?: { type: string; computed_current_score?: number | null; computed_current_grade?: string | null }[];
+  enrollments?: { type: string; computed_current_score?: number | null }[];
 };
 
-export async function whoami() {
-  const me = await get<{ id: string; name: string }>("/api/v1/users/self");
-  return { id: me.id, name: me.name };
+let courseNameCache: Promise<Map<string, string>> | undefined;
+
+export function courseNames(): Promise<Map<string, string>> {
+  courseNameCache ??= getAll<Course>("/api/v1/courses", { enrollment_state: "active" }).then(
+    (list) => new Map(list.map((c) => [c.id, c.name])),
+  );
+  return courseNameCache;
 }
 
 // Canvas keeps past courses "active" for years, so by default only return the courses
 // shown on the dashboard (the current term's courses, or whatever the user favorited).
 export async function courses(all = false) {
   const [list, cards] = await Promise.all([
-    getAll<Course>("/api/v1/courses", {
-      enrollment_state: "active",
-      "include[]": ["total_scores", "term"],
-    }),
+    getAll<Course>("/api/v1/courses", { enrollment_state: "active", "include[]": ["total_scores", "term"] }),
     all ? Promise.resolve([]) : get<{ id: string }[]>("/api/v1/dashboard/dashboard_cards"),
   ]);
   const dashboard = new Set(cards.map((c) => c.id));
-  return list
-    .filter((c) => c.name && (all || dashboard.has(c.id)))
-    .map((c) => {
-      const enrollment = c.enrollments?.find((e) => e.type === "student") ?? c.enrollments?.[0];
+  const picked = list.filter((c) => c.name && (all || dashboard.has(c.id)));
+
+  return Promise.all(
+    picked.map(async (c) => {
+      const items = await tryGet(
+        () => getAll<Assignment>(`/api/v1/courses/${c.id}/assignments`, { "include[]": ["submission"] }),
+        null,
+      );
+      const counted = items?.filter((a) => !a.omit_from_final_grade && (a.points_possible ?? 0) > 0);
+      const statuses = counted?.map(status) ?? [];
+      const graded = statuses.filter((s) => s === "graded").length;
+      const awaiting = statuses.filter((s) => s === "submitted, awaiting grade").length;
+      const score = c.enrollments?.find((e) => e.type === "student")?.computed_current_score ?? null;
+
+      let scoreNote: string | undefined;
+      if (score === null) {
+        if (c.hide_final_grades) scoreNote = "The instructor hides the course total from students.";
+        else if (counted && graded === 0) scoreNote = "No graded work yet.";
+        else scoreNote = "Canvas returned no course total.";
+      }
       return {
-        id: c.id,
+        course_id: c.id,
         name: c.name,
         code: c.course_code,
         term: c.term?.name ?? null,
-        current_score: enrollment?.computed_current_score ?? null,
-        current_grade: enrollment?.computed_current_grade ?? null,
+        current_score: score,
+        ...(scoreNote ? { score_note: scoreNote } : {}),
+        grading: c.apply_assignment_group_weights ? "weighted by assignment group" : "total points",
+        assignments_total: counted?.length ?? null,
+        graded_count: counted ? graded : null,
+        awaiting_grade_count: counted ? awaiting : null,
       };
-    });
+    }),
+  );
 }
 
 export async function todo(days = 14) {
   const start = new Date();
   const end = new Date(start.getTime() + days * 86_400_000);
-  const items = await getAll<any>("/api/v1/planner/items", {
-    start_date: start.toISOString(),
-    end_date: end.toISOString(),
+  const [items, tz] = await Promise.all([
+    getAll<any>("/api/v1/planner/items", { start_date: start.toISOString(), end_date: end.toISOString() }),
+    userTimeZone(),
+  ]);
+  return items.map((i) => {
+    const s = i.submissions || {};
+    // The planner mixes global and bare local IDs; expand everything to the course's shard.
+    const ref = i.course_id ? String(i.course_id) : undefined;
+    const id = (v: unknown) => (v === null || v === undefined ? null : toGlobalId(String(v), ref));
+    return {
+      type: i.plannable_type,
+      title: i.plannable?.title ?? i.plannable?.name,
+      course_id: id(i.course_id),
+      course: i.context_name,
+      ...(i.plannable_type === "assignment" ? { assignment_id: id(i.plannable_id) } : {}),
+      ...(i.plannable_type === "quiz" ? { quiz_id: id(i.plannable_id), assignment_id: id(i.plannable?.assignment_id) } : {}),
+      ...(!["assignment", "quiz"].includes(i.plannable_type) ? { item_id: id(i.plannable_id) } : {}),
+      ...dueFields(i.plannable_date, tz),
+      points: i.plannable?.points_possible ?? null,
+      // Canvas reports null rather than false for things that haven't happened yet.
+      submitted: s.submitted === true,
+      graded: s.graded === true,
+      missing: s.missing === true,
+      marked_done: i.planner_override?.marked_complete === true,
+      url: i.html_url ? `${BASE_URL}${i.html_url}` : undefined,
+    };
   });
-  return items.map((i) => ({
-    type: i.plannable_type,
-    course: i.context_name,
-    title: i.plannable?.title ?? i.plannable?.name,
-    due: i.plannable_date,
-    points: i.plannable?.points_possible ?? null,
-    // Canvas reports null rather than false for things that haven't happened yet.
-    submitted: i.submissions?.submitted === true,
-    graded: i.submissions?.graded === true,
-    missing: i.submissions?.missing === true,
-    marked_done: i.planner_override?.marked_complete === true,
-    url: i.html_url ? `${BASE_URL}${i.html_url}` : undefined,
-  }));
 }
 
 export async function assignments(courseId: string, bucket?: string) {
-  const list = await getAll<any>(`/api/v1/courses/${courseId}/assignments`, {
-    "include[]": ["submission"],
-    order_by: "due_at",
-    bucket,
-  });
+  const [list, tz] = await Promise.all([
+    getAll<Assignment>(`/api/v1/courses/${courseId}/assignments`, {
+      "include[]": ["submission"],
+      order_by: "due_at",
+      bucket,
+    }),
+    userTimeZone(),
+  ]);
   return list.map((a) => ({
-    id: a.id,
+    assignment_id: a.id,
+    course_id: courseId,
     name: a.name,
-    due: a.due_at,
+    ...dueFields(a.due_at, tz),
     points: a.points_possible,
+    status: status(a),
     score: a.submission?.score ?? null,
-    grade: a.submission?.grade ?? null,
-    state: a.submission?.workflow_state ?? null,
-    missing: a.submission?.missing ?? null,
-    late: a.submission?.late ?? null,
+    late: a.submission?.late === true,
     url: a.html_url,
   }));
 }
 
 // Instructors usually attach handouts as links inside the description, not as Canvas "attachments".
 export async function assignment(courseId: string, assignmentId: string) {
-  const a = await get<any>(`/api/v1/courses/${courseId}/assignments/${assignmentId}`, {
-    "include[]": ["submission"],
-  });
-  const html: string = a.description ?? "";
-  // Linked file IDs may use Canvas's short "shard~id" form, e.g. 6078~11925851.
-  const fileIds = [...new Set([...html.matchAll(/\/files\/(\d+(?:~\d+)?)/g)].map((m) => m[1]))];
+  const [a, tz] = await Promise.all([
+    get<Assignment>(`/api/v1/courses/${courseId}/assignments/${assignmentId}`, { "include[]": ["submission"] }),
+    userTimeZone(),
+  ]);
+  const html = a.description ?? "";
   const linkedFiles = await Promise.all(
-    fileIds.map(async (id) => {
+    linkedFileIds(html).map(async (id) => {
       try {
         const f = await get<any>(`/api/v1/courses/${courseId}/files/${id}`);
-        return { id: f.id, name: f.display_name, size: f.size, content_type: f["content-type"] };
+        return { file_id: f.id, name: f.display_name, size: f.size, content_type: f["content-type"] };
       } catch (err) {
-        return { id, error: (err as Error).message };
+        return { file_id: id, error: (err as Error).message };
       }
     }),
   );
   return {
-    id: a.id,
+    assignment_id: a.id,
+    course_id: courseId,
     name: a.name,
-    due: a.due_at,
+    ...dueFields(a.due_at, tz),
     points: a.points_possible,
     submission_types: a.submission_types,
-    state: a.submission?.workflow_state ?? null,
-    description: stripHtml(html).slice(0, 5000),
+    status: status(a),
+    score: a.submission?.score ?? null,
+    description: stripHtml(html).slice(0, 8000),
     linked_files: linkedFiles,
     url: a.html_url,
   };
 }
 
-// Saves a file to disk without overwriting existing files. Returns the saved path.
-export async function downloadFile(fileId: string, dir = join(homedir(), "Downloads"), courseId?: string) {
-  const meta = await get<any>(courseId ? `/api/v1/courses/${courseId}/files/${fileId}` : `/api/v1/files/${fileId}`);
-  if (!meta.url) throw new Error(`Canvas returned no download URL for file ${fileId} (it may be locked).`);
-
-  // Downloads bounce through a cross-domain login on the instructure.com host, which sets
-  // its own session cookie. Follow redirects by hand with a per-host cookie jar so the
-  // user's Canvas cookie is only ever sent to the Canvas host itself.
-  const jar = new Map<string, Map<string, string>>();
-  let url: string = meta.url;
-  let res: Response | undefined;
-  for (let hop = 0; hop < 10; hop++) {
-    const host = new URL(url).host;
-    const sameHost = host === new URL(BASE_URL).host;
-    const picked = [...(jar.get(host) ?? new Map())].map(([k, v]) => `${k}=${v}`).join("; ");
-    const h: Record<string, string> = sameHost ? headers() : {};
-    if (picked) h.Cookie = sameHost ? `${h.Cookie}; ${picked}` : picked;
-    res = await fetch(url, { headers: h, redirect: "manual" });
-    for (const c of res.headers.getSetCookie()) {
-      const [pair] = c.split(";");
-      const eq = pair.indexOf("=");
-      if (eq > 0) {
-        if (!jar.has(host)) jar.set(host, new Map());
-        jar.get(host)!.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
-      }
-    }
-    const location = res.headers.get("location");
-    if (res.status < 300 || res.status >= 400 || !location) break;
-    if (new URL(location, url).pathname.startsWith("/login")) {
-      throw new CanvasAuthError("Canvas session expired or invalid. Refresh CANVAS_COOKIE in .env.");
-    }
-    url = new URL(location, url).toString();
-  }
-  if (!res?.ok) throw new Error(`Download failed with status ${res?.status} for ${meta.display_name}`);
-
-  await mkdir(dir, { recursive: true });
-  const path = await freePath(dir, basename(meta.display_name || `canvas-file-${fileId}`));
-  await writeFile(path, Buffer.from(await res.arrayBuffer()), { flag: "wx" });
-  return { path, name: meta.display_name, size: meta.size };
-}
-
-async function freePath(dir: string, name: string): Promise<string> {
-  const ext = extname(name);
-  const stem = name.slice(0, name.length - ext.length);
-  for (let n = 0; ; n++) {
-    const candidate = join(dir, n ? `${stem} (${n})${ext}` : name);
-    try {
-      await access(candidate);
-    } catch {
-      return candidate;
-    }
-  }
-}
-
 export async function announcements(courseIds: string[], days = 30) {
-  const list = await getAll<any>("/api/v1/announcements", {
-    "context_codes[]": courseIds.map((id) => `course_${id}`),
-    start_date: new Date(Date.now() - days * 86_400_000).toISOString(),
-    end_date: new Date().toISOString(),
+  const [list, names, tz] = await Promise.all([
+    getAll<any>("/api/v1/announcements", {
+      "context_codes[]": courseIds.map((id) => `course_${id}`),
+      start_date: new Date(Date.now() - days * 86_400_000).toISOString(),
+      end_date: new Date().toISOString(),
+    }),
+    courseNames(),
+    userTimeZone(),
+  ]);
+  return list.map((a) => {
+    const courseId = String(a.context_code ?? "").replace(/^course_/, "");
+    return {
+      course_id: courseId,
+      course: names.get(courseId) ?? null,
+      title: a.title,
+      ...dueFields(a.posted_at, tz, "posted"),
+      author: a.author?.display_name,
+      message: stripHtml(a.message ?? "").slice(0, 3000),
+      url: a.html_url,
+    };
   });
-  return list.map((a) => ({
-    course: a.context_code,
-    title: a.title,
-    posted: a.posted_at,
-    author: a.author?.display_name,
-    message: stripHtml(a.message ?? "").slice(0, 2000),
-    url: a.html_url,
-  }));
 }
 
 export async function modules(courseId: string) {
   const list = await getAll<any>(`/api/v1/courses/${courseId}/modules`, { "include[]": ["items"] });
   return list.map((m) => ({
     name: m.name,
-    items: (m.items ?? []).map((i: any) => ({ type: i.type, title: i.title, url: i.html_url })),
+    items: (m.items ?? []).map((i: any) => ({
+      type: i.type,
+      title: i.title,
+      ...(i.type === "Page" ? { page_url: i.page_url } : {}),
+      ...(["File", "Assignment", "Quiz", "Discussion"].includes(i.type)
+        ? { [`${i.type.toLowerCase()}_id`]: i.content_id }
+        : {}),
+      url: i.html_url,
+    })),
   }));
 }
 
@@ -286,21 +257,200 @@ export async function files(courseId: string, search?: string) {
     order: "desc",
   });
   return list.map((f) => ({
-    id: f.id,
+    file_id: f.id,
     name: f.display_name,
     size: f.size,
+    content_type: f["content-type"],
     updated: f.updated_at,
-    url: f.url,
   }));
 }
 
-function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/\s+/g, " ")
-    .trim();
+// ---- Grades ----
+
+// Approximates Canvas's current-score math so a model can explain where a grade comes from.
+// Canvas's own number (canvas_current_score) stays the source of truth.
+export async function gradeBreakdown(courseId: string) {
+  const [course, groups, tz] = await Promise.all([
+    get<Course>(`/api/v1/courses/${courseId}`, { "include[]": ["total_scores"] }),
+    getAll<any>(`/api/v1/courses/${courseId}/assignment_groups`, { "include[]": ["assignments", "submission"] }),
+    userTimeZone(),
+  ]);
+  const weighted = course.apply_assignment_group_weights === true;
+  const allCounted = groups.flatMap((g) => countedAssignments(g.assignments));
+  const coursePoints = allCounted.reduce((sum, a) => sum + (a.points_possible ?? 0), 0);
+
+  const out = groups
+    .filter((g) => (g.assignments?.length ?? 0) > 0 || (weighted && g.group_weight > 0))
+    .map((g) => {
+      const items = countedAssignments(g.assignments ?? []);
+      const rules = g.rules ?? {};
+      const neverDrop = new Set<string>((rules.never_drop ?? []).map(String));
+      const graded = items.filter((a) => status(a) === "graded");
+
+      // Canvas drops the lowest/highest graded scores by percentage, keeping at least one.
+      const droppable = graded
+        .filter((a) => !neverDrop.has(a.id))
+        .sort((x, y) => pct(x) - pct(y));
+      const dropLow = Math.min(rules.drop_lowest ?? 0, Math.max(graded.length - 1, 0));
+      const dropHigh = Math.min(rules.drop_highest ?? 0, Math.max(graded.length - 1 - dropLow, 0));
+      const dropped = new Set([
+        ...droppable.slice(0, dropLow).map((a) => a.id),
+        ...droppable.slice(droppable.length - dropHigh).map((a) => a.id),
+      ]);
+
+      const kept = graded.filter((a) => !dropped.has(a.id));
+      const earned = kept.reduce((sum, a) => sum + (a.submission!.score ?? 0), 0);
+      const possible = kept.reduce((sum, a) => sum + (a.points_possible ?? 0), 0);
+      const groupPoints = items.reduce((sum, a) => sum + (a.points_possible ?? 0), 0);
+      const totalDrops = (rules.drop_lowest ?? 0) + (rules.drop_highest ?? 0);
+      // Drops spread a group's weight over fewer items, so each counted item is worth more.
+      const dropScale = items.length > totalDrops ? items.length / (items.length - totalDrops) : 1;
+
+      return {
+        group: g.name,
+        weight_pct: weighted ? g.group_weight : null,
+        rules: {
+          ...(rules.drop_lowest ? { drop_lowest: rules.drop_lowest } : {}),
+          ...(rules.drop_highest ? { drop_highest: rules.drop_highest } : {}),
+        },
+        items_posted: items.length,
+        graded_count: graded.length,
+        score_pct: possible > 0 ? round((earned / possible) * 100) : null,
+        points: possible > 0 ? `${round(earned)}/${round(possible)}` : null,
+        ...(items.length === 0 ? { note: "No assignments posted in this group yet." } : {}),
+        items: items.map((a) => ({
+          assignment_id: a.id,
+          name: a.name,
+          ...dueFields(a.due_at, tz),
+          points: a.points_possible,
+          score: a.submission?.score ?? null,
+          status: status(a),
+          ...(dropped.has(a.id) ? { dropped: true } : {}),
+          share_of_final_pct: weighted
+            ? groupPoints > 0
+              ? round(((g.group_weight * (a.points_possible ?? 0)) / groupPoints) * dropScale)
+              : null
+            : coursePoints > 0
+              ? round(((a.points_possible ?? 0) / coursePoints) * 100)
+              : null,
+        })),
+        _earned: earned,
+        _possible: possible,
+        _weight: g.group_weight ?? 0,
+      };
+    });
+
+  let estimate: number | null = null;
+  if (weighted) {
+    // Like Canvas, re-normalize over groups that have graded work.
+    const active = out.filter((g) => g._possible > 0 && g._weight > 0);
+    const weightSum = active.reduce((sum, g) => sum + g._weight, 0);
+    if (weightSum > 0) {
+      estimate = round(active.reduce((sum, g) => sum + (g._earned / g._possible) * g._weight, 0) / weightSum * 100);
+    }
+  } else {
+    const earned = out.reduce((sum, g) => sum + g._earned, 0);
+    const possible = out.reduce((sum, g) => sum + g._possible, 0);
+    if (possible > 0) estimate = round((earned / possible) * 100);
+  }
+
+  return {
+    course_id: courseId,
+    course: course.name,
+    grading: weighted
+      ? "Weighted by assignment group (weights below)."
+      : "Total points. Canvas does not apply group weights here, so any weights in the syllabus are NOT reflected in the Canvas score.",
+    canvas_current_score: course.enrollments?.find((e) => e.type === "student")?.computed_current_score ?? null,
+    estimated_current_score: estimate,
+    estimate_note:
+      "Estimate from graded work only, applying drop rules. Canvas's number is authoritative if they differ. share_of_final_pct assumes all posted items in a group count equally after drops.",
+    groups: out.map(({ _earned, _possible, _weight, ...g }) => g),
+  };
+}
+
+function countedAssignments(list: Assignment[]): Assignment[] {
+  return list.filter((a) => !a.omit_from_final_grade && (a.points_possible ?? 0) > 0);
+}
+
+function pct(a: Assignment): number {
+  return (a.submission?.score ?? 0) / (a.points_possible || 1);
+}
+
+function round(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+// ---- Files ----
+
+// Saves a file to disk. Never overwrites: if an identical copy already exists (same name
+// or a "(n)" variant with the same bytes), returns that path instead of saving again.
+export async function downloadFile(fileId: string, dir = join(homedir(), "Downloads"), courseId?: string) {
+  const file = await fetchFile(fileId, courseId);
+  await mkdir(dir, { recursive: true });
+  const name = basename(file.name);
+  const ext = extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  for (let n = 0; ; n++) {
+    const path = join(dir, n ? `${stem} (${n})${ext}` : name);
+    let existing: Buffer | undefined;
+    try {
+      await access(path);
+      existing = await readFs(path);
+    } catch {
+      await writeFile(path, file.bytes, { flag: "wx" });
+      return { file_id: file.id, path, name: file.name, size: file.bytes.length, already_downloaded: false };
+    }
+    if (existing.equals(file.bytes)) {
+      return { file_id: file.id, path, name: file.name, size: file.bytes.length, already_downloaded: true };
+    }
+  }
+}
+
+const execFileAsync = promisify(execFile);
+const PDFTOTEXT = ["pdftotext", "/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext"];
+
+async function pdfToText(bytes: Buffer): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "canvas-mcp-"));
+  const pdf = join(dir, "file.pdf");
+  try {
+    await writeFile(pdf, bytes);
+    for (const bin of PDFTOTEXT) {
+      try {
+        return (await execFileAsync(bin, ["-layout", pdf, "-"], { maxBuffer: 50 * 1024 * 1024 })).stdout;
+      } catch (err: any) {
+        if (err.code !== "ENOENT") throw new Error(`pdftotext failed: ${err.message}`);
+      }
+    }
+    throw new Error("Reading PDFs needs pdftotext. Install it with: brew install poppler");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const TEXT_TYPES = /^(text\/|application\/(json|xml|csv|x-csv|javascript))/;
+
+// Returns a file's text without saving it. Long files are paged with offset/max_chars.
+export async function readFile(fileId: string, courseId?: string, offset = 0, maxChars = 20_000) {
+  const file = await fetchFile(fileId, courseId);
+  const ext = extname(file.name).toLowerCase();
+  let text: string;
+  if (file.contentType === "application/pdf" || ext === ".pdf") text = await pdfToText(file.bytes);
+  else if (file.contentType === "text/html" || ext === ".html" || ext === ".htm") text = stripHtml(file.bytes.toString("utf8"));
+  else if (TEXT_TYPES.test(file.contentType) || [".txt", ".md", ".csv", ".json"].includes(ext)) text = file.bytes.toString("utf8");
+  else {
+    throw new Error(
+      `Can't extract text from ${file.name} (${file.contentType || ext}). Use canvas_download_file and open it instead.`,
+    );
+  }
+  text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  const slice = text.slice(offset, offset + maxChars);
+  const end = offset + slice.length;
+  return {
+    file_id: file.id,
+    name: file.name,
+    total_chars: text.length,
+    offset,
+    ...(end < text.length ? { truncated: true, next_offset: end } : {}),
+    text: slice,
+  };
 }
