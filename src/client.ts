@@ -75,11 +75,6 @@ export async function logout(): Promise<void> {
   session = undefined;
 }
 
-function csrfToken(cookie: string): string | undefined {
-  const match = cookie.match(/(?:^|;\s*)_csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : undefined;
-}
-
 export async function headers(): Promise<Record<string, string>> {
   let s = await currentSession();
   if (!s) {
@@ -87,15 +82,11 @@ export async function headers(): Promise<Record<string, string>> {
     s = await currentSession();
   }
   if (!s) throw new CanvasAuthError(`Not signed in to Canvas. ${LOGIN_HINT}`);
-  const h: Record<string, string> = {
+  return {
     Cookie: s.cookie,
-    // Return IDs as strings: WashU IDs exceed Number.MAX_SAFE_INTEGER and would be rounded.
+    // IDs as strings: cross-shard IDs exceed Number.MAX_SAFE_INTEGER and would be rounded.
     Accept: "application/json+canvas-string-ids",
-    "X-Requested-With": "XMLHttpRequest",
   };
-  const csrf = csrfToken(s.cookie);
-  if (csrf) h["X-CSRF-Token"] = csrf;
-  return h;
 }
 
 // Canvas prefixes session-authenticated JSON with `while(1);` to block JSON hijacking.
@@ -108,7 +99,7 @@ function nextLink(link: string | null): string | undefined {
   return link?.split(",").find((part) => part.includes('rel="next"'))?.match(/<([^>]+)>/)?.[1];
 }
 
-export type Params = Record<string, string | number | boolean | string[] | undefined>;
+type Params = Record<string, string | number | boolean | string[] | undefined>;
 
 function buildUrl(path: string, params: Params = {}): string {
   const url = new URL(path.startsWith("http") ? path : `${BASE_URL}${path}`);
@@ -163,26 +154,6 @@ export async function tryGet<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
-// ---- IDs ----
-
-// Canvas has two spellings of the same ID: global ("60780000000180256") and
-// shard-local ("6078~180256", used in web URLs). Everything here uses the global form.
-const SHARD_FACTOR = 10_000_000_000_000n;
-
-// Some endpoints (e.g. planner) also return bare local IDs like "999436"; pass `sameShardAs`
-// (any global ID from the same course) to expand those.
-export function toGlobalId(id: string | number, sameShardAs?: string): string {
-  const s = String(id).trim();
-  const short = s.match(/^(\d+)~(\d+)$/);
-  if (short) return (BigInt(short[1]) * SHARD_FACTOR + BigInt(short[2])).toString();
-  if (!/^\d+$/.test(s)) throw new Error(`Not a Canvas ID: ${s}`);
-  if (sameShardAs && BigInt(s) < SHARD_FACTOR) {
-    const shard = BigInt(toGlobalId(sameShardAs)) / SHARD_FACTOR;
-    if (shard > 0n) return (shard * SHARD_FACTOR + BigInt(s)).toString();
-  }
-  return s;
-}
-
 // ---- Dates ----
 
 let timeZone: Promise<string> | undefined;
@@ -223,37 +194,19 @@ function relative(date: Date): string {
 
 // ---- Files ----
 
-// Downloads bounce through a cross-domain login on the instructure.com host, which sets
-// its own session cookie. Follow redirects by hand with a per-host cookie jar so the
-// user's Canvas cookie is only ever sent to the Canvas host itself.
+// The Canvas host redirects downloads to a signed, short-lived URL on its file servers. Only
+// that first request carries the session cookie; the signed URL needs none.
 export async function fetchFile(fileId: string, courseId?: string) {
   const meta = await get<any>(courseId ? `/api/v1/courses/${courseId}/files/${fileId}` : `/api/v1/files/${fileId}`);
   if (!meta.url) throw new Error(`Canvas returned no download URL for file ${fileId} (it may be locked).`);
 
-  const jar = new Map<string, Map<string, string>>();
-  let url: string = meta.url;
-  let res: Response | undefined;
-  for (let hop = 0; hop < 10; hop++) {
-    const host = new URL(url).host;
-    const sameHost = host === new URL(BASE_URL).host;
-    const picked = [...(jar.get(host) ?? new Map())].map(([k, v]) => `${k}=${v}`).join("; ");
-    const h: Record<string, string> = sameHost ? await headers() : {};
-    if (picked) h.Cookie = sameHost ? `${h.Cookie}; ${picked}` : picked;
-    res = await fetch(url, { headers: h, redirect: "manual" });
-    for (const c of res.headers.getSetCookie()) {
-      const [pair] = c.split(";");
-      const eq = pair.indexOf("=");
-      if (eq > 0) {
-        if (!jar.has(host)) jar.set(host, new Map());
-        jar.get(host)!.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
-      }
-    }
-    const location = res.headers.get("location");
-    if (res.status < 300 || res.status >= 400 || !location) break;
-    if (new URL(location, url).pathname.startsWith("/login")) throw new CanvasAuthError(EXPIRED);
-    url = new URL(location, url).toString();
+  const first = await fetch(meta.url, { headers: await headers(), redirect: "manual" });
+  const location = first.headers.get("location");
+  if (first.status === 401 || (location && new URL(location, meta.url).pathname.startsWith("/login"))) {
+    throw new CanvasAuthError(EXPIRED);
   }
-  if (!res?.ok) throw new Error(`Download failed with status ${res?.status} for ${meta.display_name}`);
+  const res = location ? await fetch(new URL(location, meta.url)) : first;
+  if (!res.ok) throw new Error(`Download failed with status ${res.status} for ${meta.display_name}`);
 
   return {
     id: meta.id as string,
@@ -263,11 +216,10 @@ export async function fetchFile(fileId: string, courseId?: string) {
   };
 }
 
-// File IDs linked from HTML (pages, descriptions), in either ID spelling. Only links
-// (href) count; images embedded in the page (src) are skipped.
+// File IDs linked from HTML (pages, descriptions). Only links (href) count; images embedded
+// in the page (src) are skipped.
 export function linkedFileIds(html: string): string[] {
-  const ids = [...html.matchAll(/href="[^"]*\/files\/(\d+(?:~\d+)?)/g)].map((m) => toGlobalId(m[1]));
-  return [...new Set(ids)];
+  return [...new Set([...html.matchAll(/href="[^"]*\/files\/(\d+(?:~\d+)?)/g)].map((m) => m[1]))];
 }
 
 export function stripHtml(html: string): string {

@@ -77,7 +77,7 @@ async function loadSecret(baseUrl: string, kind: Secret): Promise<string | undef
   try {
     data = (await readFile(secretFile(baseUrl, kind), "utf8")).trim();
   } catch {
-    return kind === "session" && ENCRYPT ? loadLegacyKeychainSession(baseUrl) : undefined;
+    return undefined;
   }
   if (!ENCRYPT) return data || undefined;
   try {
@@ -109,37 +109,18 @@ async function deleteSecret(baseUrl: string, kind: Secret): Promise<void> {
   await rm(secretFile(baseUrl, kind), { force: true });
 }
 
-// Early versions kept the session cookie directly in the Keychain; still read it once.
-async function loadLegacyKeychainSession(baseUrl: string): Promise<string | undefined> {
-  try {
-    const out = await security(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", host(baseUrl), "-w"]);
-    return /^(?:[0-9a-f]{2})+$/.test(out) ? Buffer.from(out, "hex").toString("utf8") : out || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export async function loadStored(baseUrl: string): Promise<Session | undefined> {
   const cookie = await loadSecret(baseUrl, "session");
   return cookie ? { cookie, source: "saved" } : undefined;
 }
 
-export function saveStored(baseUrl: string, cookie: string): Promise<void> {
-  return saveSecret(baseUrl, "session", cookie);
-}
-
-export function clearStored(baseUrl: string): Promise<void> {
-  return deleteSecret(baseUrl, "session");
-}
 
 // Forget everything, so the next login asks for SSO again.
 export async function logout(baseUrl: string): Promise<void> {
   await deleteSecret(baseUrl, "session");
   await deleteSecret(baseUrl, "browser");
   if (ENCRYPT) {
-    for (const acct of [host(baseUrl), `${host(baseUrl)}#browser`, `${host(baseUrl)}#key`]) {
-      await security(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct]).catch(() => {});
-    }
+    await security(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", `${host(baseUrl)}#key`]).catch(() => {});
   }
   await rm(profileDir(baseUrl), { recursive: true, force: true });
 }
@@ -150,7 +131,7 @@ export async function logout(baseUrl: string): Promise<void> {
 async function apiStatus(baseUrl: string, cookie: string): Promise<number> {
   try {
     const res = await fetch(`${baseUrl}/api/v1/users/self`, {
-      headers: { Cookie: cookie, Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+      headers: { Cookie: cookie, Accept: "application/json" },
       redirect: "manual",
     });
     await res.body?.cancel();
@@ -160,7 +141,7 @@ async function apiStatus(baseUrl: string, cookie: string): Promise<number> {
   }
 }
 
-export async function isValid(baseUrl: string, cookie: string): Promise<boolean> {
+async function isValid(baseUrl: string, cookie: string): Promise<boolean> {
   return (await apiStatus(baseUrl, cookie)) === 200;
 }
 
@@ -183,16 +164,14 @@ async function launch(baseUrl: string, headless: boolean) {
     chromiumSandbox: true,
     args: ["--no-first-run", "--no-default-browser-check"],
   };
-  for (const channel of ["chrome", "msedge"]) {
-    try {
-      return await chromium.launchPersistentContext(profileDir(baseUrl), { ...options, channel });
-    } catch (err) {
-      if (/ProcessSingleton|SingletonLock|already in use/i.test(String(err))) {
-        throw new Error("The Canvas login window is already open. Finish signing in there.");
-      }
+  try {
+    return await chromium.launchPersistentContext(profileDir(baseUrl), { ...options, channel: "chrome" });
+  } catch (err) {
+    if (/ProcessSingleton|SingletonLock|already in use/i.test(String(err))) {
+      throw new Error("The Canvas login window is already open. Finish signing in there.");
     }
+    throw new Error(`Couldn't start Google Chrome for Canvas login (is it installed?): ${(err as Error).message.split("\n")[0]}`);
   }
-  throw new Error("Couldn't start Chrome or Edge for Canvas login. Install Google Chrome and try again.");
 }
 
 function where(url: string): string {
@@ -299,7 +278,7 @@ async function releaseLock(): Promise<void> {
 
 // ---- Public: get a working session, logging in if needed ----
 
-export type RefreshOptions = {
+type RefreshOptions = {
   // Skip reusing stored/.env cookies and go straight to the browser.
   force?: boolean;
   // Max time to wait for the user to finish signing in.
@@ -355,7 +334,7 @@ async function doRefresh(baseUrl: string, opts: RefreshOptions): Promise<Session
       opts.onWindow?.();
       cookie = await browserLogin(baseUrl, false, timeoutMs, opts.log);
     }
-    await saveStored(baseUrl, cookie);
+    await saveSecret(baseUrl, "session", cookie);
     return { cookie, source: "login" };
   } finally {
     await releaseLock();

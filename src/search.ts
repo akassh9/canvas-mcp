@@ -2,7 +2,7 @@
 // students, so this builds a small index from everything a student can read.
 
 import { files, readFile } from "./canvas.ts";
-import { BASE_URL, get, getAll, linkedFileIds, stripHtml, toGlobalId, tryGet } from "./client.ts";
+import { BASE_URL, get, getAll, linkedFileIds, stripHtml, tryGet } from "./client.ts";
 
 type Doc = {
   type: "syllabus" | "front_page" | "page" | "assignment" | "quiz" | "discussion" | "announcement" | "module" | "file";
@@ -15,7 +15,7 @@ type Doc = {
 const TTL_MS = 10 * 60_000;
 const cache = new Map<string, { at: number; docs: Promise<Doc[]> }>();
 
-export function courseIndex(courseId: string): Promise<Doc[]> {
+function courseIndex(courseId: string): Promise<Doc[]> {
   const hit = cache.get(courseId);
   if (hit && Date.now() - hit.at < TTL_MS) return hit.docs;
   const docs = buildIndex(courseId);
@@ -42,7 +42,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 function fileLinks(html: string, from: string): { id: string; label: string; from: string }[] {
   const labels = new Map<string, string>();
   for (const m of html.matchAll(/<a\b[^>]*href="[^"]*\/files\/(\d+(?:~\d+)?)[^"]*"[^>]*>([\s\S]*?)<\/a>/gi)) {
-    labels.set(toGlobalId(m[1]), stripHtml(m[2]));
+    labels.set(m[1], stripHtml(m[2]));
   }
   return linkedFileIds(html).map((id) => ({ id, label: labels.get(id) ?? "", from }));
 }

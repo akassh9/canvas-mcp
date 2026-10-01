@@ -1,10 +1,10 @@
 // Quick smoke test: node src/cli.ts <command> [args...]
 import * as canvas from "./canvas.ts";
-import { login, logout, toGlobalId } from "./client.ts";
+import { login, logout } from "./client.ts";
 import * as search from "./search.ts";
 
 const [command = "whoami", ...args] = process.argv.slice(2);
-const id = (i: number) => toGlobalId(args[i]);
+const id = (i: number) => args[i];
 
 const commands: Record<string, () => Promise<unknown>> = {
   login: async () => {
@@ -36,8 +36,8 @@ const commands: Record<string, () => Promise<unknown>> = {
   files: () => search.courseFiles(id(0), args[1]),
   search: () => search.search(id(0), args.slice(1).join(" ")),
   syllabus: () => search.syllabus(id(0)),
-  read: () => canvas.readFile(id(0), args[1] && toGlobalId(args[1])),
-  download: () => canvas.downloadFile(id(0), undefined, args[1] && toGlobalId(args[1])),
+  read: () => canvas.readFile(id(0), args[1]),
+  download: () => canvas.downloadFile(id(0), undefined, args[1]),
 };
 
 if (!commands[command]) {

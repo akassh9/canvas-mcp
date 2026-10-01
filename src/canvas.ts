@@ -1,6 +1,5 @@
 // Read-only Canvas helpers that return compact, model-friendly shapes.
-// IDs are in the form Canvas uses on this host (inputs accept any form); dates come with
-// local time and a relative hint.
+// IDs are passed through as Canvas returns them; dates come with local time and a relative hint.
 
 import { execFile } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile as readFs, rm, writeFile } from "node:fs/promises";
@@ -16,12 +15,11 @@ import {
   linkedFileIds,
   sessionSource,
   stripHtml,
-  toGlobalId,
   tryGet,
   userTimeZone,
 } from "./client.ts";
 
-export { CanvasAuthError, get, getAll, toGlobalId } from "./client.ts";
+export { CanvasAuthError, get, getAll } from "./client.ts";
 
 type Submission = {
   score: number | null;
@@ -76,7 +74,7 @@ type Course = {
 
 let courseNameCache: Promise<Map<string, string>> | undefined;
 
-export function courseNames(): Promise<Map<string, string>> {
+function courseNames(): Promise<Map<string, string>> {
   courseNameCache ??= getAll<Course>("/api/v1/courses", { enrollment_state: "active" }).then(
     (list) => new Map(list.map((c) => [c.id, c.name])),
   );
@@ -136,17 +134,14 @@ export async function todo(days = 14) {
   ]);
   return items.map((i) => {
     const s = i.submissions || {};
-    // The planner mixes global and bare local IDs; expand everything to the course's shard.
-    const ref = i.course_id ? String(i.course_id) : undefined;
-    const id = (v: unknown) => (v === null || v === undefined ? null : toGlobalId(String(v), ref));
     return {
       type: i.plannable_type,
       title: i.plannable?.title ?? i.plannable?.name,
-      course_id: id(i.course_id),
+      course_id: i.course_id ?? null,
       course: i.context_name,
-      ...(i.plannable_type === "assignment" ? { assignment_id: id(i.plannable_id) } : {}),
-      ...(i.plannable_type === "quiz" ? { quiz_id: id(i.plannable_id), assignment_id: id(i.plannable?.assignment_id) } : {}),
-      ...(!["assignment", "quiz"].includes(i.plannable_type) ? { item_id: id(i.plannable_id) } : {}),
+      ...(i.plannable_type === "assignment" ? { assignment_id: i.plannable_id } : {}),
+      ...(i.plannable_type === "quiz" ? { quiz_id: i.plannable_id, assignment_id: i.plannable?.assignment_id ?? null } : {}),
+      ...(!["assignment", "quiz"].includes(i.plannable_type) ? { item_id: i.plannable_id } : {}),
       ...dueFields(i.plannable_date, tz),
       points: i.plannable?.points_possible ?? null,
       // Canvas reports null rather than false for things that haven't happened yet.

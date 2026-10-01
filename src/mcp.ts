@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as canvas from "./canvas.ts";
-import { login, toGlobalId } from "./client.ts";
+import { login } from "./client.ts";
 import * as search from "./search.ts";
 
 const TOOL_NAMES = [
@@ -35,12 +35,12 @@ async function run(fn: () => Promise<unknown>) {
   }
 }
 
-// Accepts both ID spellings Canvas uses ("60780000000180256" or "6078~180256").
+// Canvas accepts every ID spelling it uses ("180256", "6078~180256", "60780000000180256").
 const canvasId = (what: string) =>
   z.coerce
     .string()
-    .regex(/^\d+(~\d+)?$/, `${what} must be a Canvas ID like 60780000000180256 or 6078~180256`)
-    .describe(`Canvas ${what} (either ID format is accepted)`);
+    .regex(/^\d+(~\d+)?$/, `${what} must be a Canvas ID like 180256 or 6078~180256`)
+    .describe(`Canvas ${what}`);
 
 const courseId = canvasId("course ID");
 
@@ -97,7 +97,7 @@ server.registerTool(
         .describe("Optional filter"),
     },
   },
-  ({ course_id, bucket }) => run(() => canvas.assignments(toGlobalId(course_id), bucket)),
+  ({ course_id, bucket }) => run(() => canvas.assignments(course_id, bucket)),
 );
 
 server.registerTool(
@@ -106,7 +106,7 @@ server.registerTool(
     description: "One assignment's full instructions, status, score, and the files linked in its description (with file_ids).",
     inputSchema: { course_id: courseId, assignment_id: canvasId("assignment ID") },
   },
-  ({ course_id, assignment_id }) => run(() => canvas.assignment(toGlobalId(course_id), toGlobalId(assignment_id))),
+  ({ course_id, assignment_id }) => run(() => canvas.assignment(course_id, assignment_id)),
 );
 
 server.registerTool(
@@ -116,7 +116,7 @@ server.registerTool(
       "How a course grade is built: whether Canvas weights assignment groups, each group's weight and drop rules, your score per group, and each item's approximate share of the final grade. Use for 'what's my grade made of' or 'how much is X worth'.",
     inputSchema: { course_id: courseId },
   },
-  ({ course_id }) => run(() => canvas.gradeBreakdown(toGlobalId(course_id))),
+  ({ course_id }) => run(() => canvas.gradeBreakdown(course_id)),
 );
 
 server.registerTool(
@@ -131,7 +131,7 @@ server.registerTool(
   ({ course_ids, days }) =>
     run(async () => {
       const ids = course_ids?.length
-        ? course_ids.map((id) => toGlobalId(id))
+        ? course_ids
         : (await canvas.courses()).map((c) => c.course_id);
       return canvas.announcements(ids, days);
     }),
@@ -140,7 +140,7 @@ server.registerTool(
 server.registerTool(
   "canvas_modules",
   { description: "Modules and their items for one course, with IDs for each item.", inputSchema: { course_id: courseId } },
-  ({ course_id }) => run(() => canvas.modules(toGlobalId(course_id))),
+  ({ course_id }) => run(() => canvas.modules(course_id)),
 );
 
 server.registerTool(
@@ -150,7 +150,7 @@ server.registerTool(
       "Files in one course, by name. If the course hides its Files tab, falls back to files linked from its pages, modules and assignments.",
     inputSchema: { course_id: courseId, search: z.string().min(2).optional().describe("Filter by file name") },
   },
-  ({ course_id, search: q }) => run(() => search.courseFiles(toGlobalId(course_id), q)),
+  ({ course_id, search: q }) => run(() => search.courseFiles(course_id, q)),
 );
 
 server.registerTool(
@@ -168,7 +168,7 @@ server.registerTool(
       limit: z.number().int().min(1).max(30).default(10),
     },
   },
-  ({ course_id, query, types, limit }) => run(() => search.search(toGlobalId(course_id), query, types, limit)),
+  ({ course_id, query, types, limit }) => run(() => search.search(course_id, query, types, limit)),
 );
 
 server.registerTool(
@@ -178,7 +178,7 @@ server.registerTool(
       "Find and return a course's syllabus text. Checks the Syllabus tab, then files and pages named or linked as 'syllabus' (reads PDFs).",
     inputSchema: { course_id: courseId },
   },
-  ({ course_id }) => run(() => search.syllabus(toGlobalId(course_id))),
+  ({ course_id }) => run(() => search.syllabus(course_id)),
 );
 
 const fileId = canvasId("file ID");
@@ -196,7 +196,7 @@ server.registerTool(
     },
   },
   ({ file_id, course_id, offset, max_chars }) =>
-    run(() => canvas.readFile(toGlobalId(file_id), course_id && toGlobalId(course_id), offset, max_chars)),
+    run(() => canvas.readFile(file_id, course_id, offset, max_chars)),
 );
 
 server.registerTool(
@@ -211,7 +211,7 @@ server.registerTool(
     },
   },
   ({ file_id, course_id, dir }) =>
-    run(() => canvas.downloadFile(toGlobalId(file_id), dir, course_id && toGlobalId(course_id))),
+    run(() => canvas.downloadFile(file_id, dir, course_id)),
 );
 
 // Keeps only the requested fields; "assignments.name" reaches into nested objects/arrays.

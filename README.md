@@ -63,5 +63,5 @@ claude mcp add canvas -s user -- node "$(pwd)/src/mcp.ts"   # run from the repo 
 | `canvas_login` | Re-run sign-in on request (expiry is handled automatically) |
 
 Notes:
-- IDs in output use the form Canvas uses on your host; any form is accepted as input. Dates come with `*_local` (your Canvas time zone) and `*_in`.
+- IDs are passed through as Canvas returns them. Dates come with `*_local` (your Canvas time zone) and `*_in`.
 - Search results are cached for 10 minutes per course within a session.
